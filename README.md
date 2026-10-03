@@ -17,4 +17,4 @@ python3 -m pipx ensurepath
 
 
 
-pipx install git+https://github.com/Gdev45/uk_retro_radar.git
+pipx install git+https://github.com/Gdev45/uk_cli_radar.git
