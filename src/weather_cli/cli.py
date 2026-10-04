@@ -128,7 +128,7 @@ _min_x1, _min_y1 = lonlat_to_map(MIN_EXTENT[1], MIN_EXTENT[3])
 MIN_EXTENT_M = [_min_x0, _min_x1, _min_y0, _min_y1]
 
 RAIN_VMIN = 0.05
-RAIN_VMAX = 16.0
+RAIN_VMAX = 20.0
 
 # Bottom UI stack (fractions of figure height):
 #   status bar -> button row 1 -> button row 2 -> colour bar -> map
@@ -1129,7 +1129,7 @@ def reverse_custom_palette(event=None):
 
 def get_radar_norm():
     return colors.PowerNorm(
-        gamma=0.55,
+        gamma=0.85,
         vmin=RAIN_VMIN,
         vmax=RAIN_VMAX,
         clip=True,
