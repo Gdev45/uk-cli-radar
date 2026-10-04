@@ -1180,8 +1180,12 @@ def reverse_custom_palette(event=None):
 # ---------------------------------------------------------------------------
 
 def get_radar_norm():
+    """Use a slightly more linear curve for custom palettes so they don't look
+    overly harsh or "sensitive" to small rainfall changes.
+    """
+    gamma = 1.0 if state.get("custom_radar_palette") else 0.85
     return colors.PowerNorm(
-        gamma=0.85,
+        gamma=gamma,
         vmin=RAIN_VMIN,
         vmax=RAIN_VMAX,
         clip=True,
