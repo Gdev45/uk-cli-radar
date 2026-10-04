@@ -985,41 +985,33 @@ def satellite_tick():
 # ---------------------------------------------------------------------------
 
 def normalize_custom_palette_order(palette):
-    """Flip reversed palettes so the warm end is mapped to higher radar values."""
-    if len(palette) < 2:
-        return palette
+    """Keep the file's declared colour order and only normalise the positions.
 
-    entries = []
+    Custom .pal/.pals files should be displayed exactly as authored. The user can
+    explicitly reverse a palette via the REVERSE button if they want the colours
+    flipped in the opposite direction.
+    """
+    normalized = []
+
     for index, entry in enumerate(palette):
         if isinstance(entry, (tuple, list)) and len(entry) == 2:
             pos, value = entry
-            entries.append((pos, value))
+            if isinstance(pos, (int, float)):
+                pos = float(pos)
+            else:
+                pos = index / (len(palette) - 1) if len(palette) > 1 else 0.0
         else:
-            entries.append((index / (len(palette) - 1), entry))
+            pos = index / (len(palette) - 1) if len(palette) > 1 else 0.0
+            value = entry
 
-    def resolve_rgb(value):
-        if isinstance(value, str):
-            return colors.to_rgb(value)
-        if isinstance(value, (tuple, list)) and len(value) == 3:
-            return tuple(float(v) for v in value)
-        raise TypeError(f"Unsupported palette colour entry: {value!r}")
+        if pos < 0.0:
+            pos = 0.0
+        elif pos > 1.0:
+            pos = 1.0
 
-    def warm_score(value):
-        r, g, b = resolve_rgb(value)
-        return (0.55 * r) + (0.35 * g) + (0.10 * b)
+        normalized.append((pos, value))
 
-    first_score = warm_score(entries[0][1])
-    last_score = warm_score(entries[-1][1])
-
-    if first_score > last_score + 0.12:
-        reversed_colors = [entry[1] for entry in reversed(entries)]
-        normalized = [
-            (0.0 if len(reversed_colors) == 1 else index / (len(reversed_colors) - 1), value)
-            for index, value in enumerate(reversed_colors)
-        ]
-        return normalized
-
-    return [(0.0 if len(entries) == 1 else index / (len(entries) - 1), value) for index, (_, value) in enumerate(entries)]
+    return normalized
 
 
 def parse_pals_palette(path):
