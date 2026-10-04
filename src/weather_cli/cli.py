@@ -1125,8 +1125,9 @@ def load_custom_palette(event=None):
             f"PALETTE -> Loaded custom radar table '{state['custom_radar_name']}'"
         )
 
-        if state["product"] == "radar" and state.get("payload") is not None:
+        if state["product"] == "radar":
             redraw()
+            fig.canvas.draw_idle()
 
     except Exception as exc:
         log_status(f"PALETTE ERROR -> {type(exc).__name__}: {exc}")
@@ -1143,8 +1144,9 @@ def reverse_custom_palette(event=None):
     )
     log_status("PALETTE -> Reversed custom radar table direction.")
 
-    if state["product"] == "radar" and state.get("payload") is not None:
+    if state["product"] == "radar":
         redraw()
+        fig.canvas.draw_idle()
 
 
 # ---------------------------------------------------------------------------
