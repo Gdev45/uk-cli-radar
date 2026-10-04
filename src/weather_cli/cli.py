@@ -1115,7 +1115,7 @@ def parse_pals_palette(path):
 
 
 def apply_custom_palette(palette, name=None):
-    """Store a palette and immediately refresh the radar legend and image."""
+    """Store a palette and refresh the active radar legend without crashing early."""
     state["custom_radar_palette"] = normalize_custom_palette_order(palette)
 
     if name is not None:
@@ -1124,7 +1124,10 @@ def apply_custom_palette(palette, name=None):
     if state["product"] == "radar":
         if state.get("cax") is not None:
             draw_radar_colourbar()
-        redraw()
+
+        if state.get("payload") is not None:
+            redraw()
+
         if fig is not None:
             fig.canvas.draw_idle()
 
