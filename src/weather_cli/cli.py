@@ -1237,16 +1237,20 @@ def get_fax_radar_colours():
 # RADAR LEGEND
 # ---------------------------------------------------------------------------
 
-def draw_radar_colourbar():
+def hide_radar_colourbar():
+    if state["cbar"] is not None:
+        try:
+            state["cbar"].remove()
+        except Exception:
+            pass
+        state["cbar"] = None
 
-    if not state["fax_mode"]:
-
+    if state["cax"] is not None:
         state["cax"].set_visible(False)
 
-        if state["cbar"] is not None:
-            state["cbar"].remove()
-            state["cbar"] = None
 
+def draw_radar_colourbar():
+    if state["cax"] is None:
         return
 
     if state["cbar"] is not None:
@@ -1254,8 +1258,40 @@ def draw_radar_colourbar():
             state["cbar"].remove()
         except Exception:
             pass
-
         state["cbar"] = None
+
+    if not state["fax_mode"]:
+        cmap = get_radar_colormap()
+        norm = get_radar_norm()
+
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+        sm.set_array([])
+
+        state["cbar"] = fig.colorbar(
+            sm,
+            cax=state["cax"],
+            orientation="horizontal",
+            ticks=[0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20],
+        )
+
+        state["cbar"].set_label(
+            "RAINFALL RATE (mm/h)",
+            color="white",
+            fontsize=8,
+            fontname=RETRO_FONT,
+        )
+
+        state["cbar"].ax.tick_params(
+            colors="white",
+            labelsize=7,
+            length=3,
+            width=0.8,
+        )
+        state["cbar"].ax.set_facecolor("black")
+        state["cbar"].outline.set_edgecolor("#b89b00")
+        state["cbar"].outline.set_linewidth(0.8)
+        state["cax"].set_visible(True)
+        return
 
     boundaries = get_fax_radar_levels()
     colours = get_fax_radar_colours()
@@ -1271,21 +1307,21 @@ def draw_radar_colourbar():
         cax=state["cax"],
         orientation="horizontal",
         boundaries=boundaries,
-        ticks=boundaries
+        ticks=boundaries,
     )
 
     state["cbar"].set_label(
         "RAINFALL RATE (mm/h)",
         color="black",
         fontsize=8,
-        fontname=RETRO_FONT
+        fontname=RETRO_FONT,
     )
 
     state["cbar"].ax.tick_params(
         colors="black",
         labelsize=7,
         length=3,
-        width=0.8
+        width=0.8,
     )
 
     state["cbar"].ax.set_facecolor("white")
@@ -1556,6 +1592,7 @@ def draw_lightning():
     set_map_extent(current_extent)
 
     draw_basemap()
+    hide_radar_colourbar()
 
     if state.get("payload") is not None:
         add_radar_layer(alpha=0.18, zorder=1)
@@ -1643,6 +1680,7 @@ def draw_warnings():
     set_map_extent(get_default_extent())
 
     draw_basemap()
+    hide_radar_colourbar()
 
     if state["warnings"]:
         # Wrap long lines so they stay inside a narrow portrait panel.
@@ -2066,7 +2104,7 @@ def main():
     ax.set_aspect("equal", adjustable="box")
 
     # -----------------------------------------------------------------------
-    # COLOUR BAR (only shown in FAX mode)
+    # COLOUR BAR (shown beneath the radar map in both normal and FAX modes)
     # -----------------------------------------------------------------------
 
     state["cax"] = fig.add_axes(
