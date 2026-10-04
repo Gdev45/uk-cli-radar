@@ -1115,21 +1115,21 @@ def parse_pals_palette(path):
 
 
 def apply_custom_palette(palette, name=None):
-    """Store a palette and refresh the active radar legend without crashing early."""
+    """Store a palette and force the active radar legend back visible."""
     state["custom_radar_palette"] = normalize_custom_palette_order(palette)
 
     if name is not None:
         state["custom_radar_name"] = name
 
-    if state["product"] == "radar":
-        if state.get("cax") is not None:
-            draw_radar_colourbar()
+    if state.get("cax") is not None:
+        state["cax"].set_visible(True)
+        draw_radar_colourbar()
 
-        if state.get("payload") is not None:
-            redraw()
+    if state["product"] == "radar" and state.get("payload") is not None:
+        redraw()
 
-        if fig is not None:
-            fig.canvas.draw_idle()
+    if fig is not None:
+        fig.canvas.draw_idle()
 
 
 def load_custom_palette(event=None):
