@@ -14,6 +14,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.image as mpimg
 import matplotlib.colors as colors
+import matplotlib.font_manager as fm
 
 import cartopy.crs as ccrs
 
@@ -42,7 +43,24 @@ LIGHTNING_TILE_URL = (
 LIGHTNING_REFRESH_SECONDS = 10
 LIGHTNING_EXTENT = [-10.5, 2.5, 48.5, 60.5]
 
-RETRO_FONT = "Courier New"
+def get_retro_font():
+    """Choose an installed monospace font that works on Linux and Windows."""
+    candidates = [
+        "DejaVu Sans Mono",
+        "Liberation Mono",
+        "Courier New",
+        "monospace",
+    ]
+    available = {font.name for font in fm.fontManager.ttflist}
+
+    for candidate in candidates:
+        if candidate in available:
+            return candidate
+
+    return "monospace"
+
+
+RETRO_FONT = get_retro_font()
 
 # ---------------------------------------------------------------------------
 # MAP PROJECTION
@@ -547,10 +565,20 @@ def zoom_map(event):
     if event.xdata is None or event.ydata is None:
         return
 
-    if event.button == "up":
+    button = getattr(event, "button", None)
+    step = getattr(event, "step", None)
+
+    if button in ("up", "scroll up", "scrollup", 1):
         scale = 0.75
-    elif event.button == "down":
+    elif button in ("down", "scroll down", "scrolldown", -1):
         scale = 1.25
+    elif step is not None:
+        if step > 0:
+            scale = 0.75
+        elif step < 0:
+            scale = 1.25
+        else:
+            return
     else:
         return
 
