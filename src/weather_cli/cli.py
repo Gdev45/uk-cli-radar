@@ -1180,11 +1180,11 @@ def reverse_custom_palette(event=None):
 # ---------------------------------------------------------------------------
 
 def get_radar_norm():
-    """Use a slightly more sensitive mapping so light rain reads a little
-    heavier without making the whole radar look over-saturated.
+    """Push the lower-rain end up a touch so light rain is more visible
+    without making the full radar image wash out.
     """
     return colors.PowerNorm(
-        gamma=0.9,
+        gamma=0.8,
         vmin=RAIN_VMIN,
         vmax=RAIN_VMAX,
         clip=True,
