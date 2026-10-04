@@ -1114,6 +1114,21 @@ def parse_pals_palette(path):
     return normalized
 
 
+def apply_custom_palette(palette, name=None):
+    """Store a palette and immediately refresh the radar legend and image."""
+    state["custom_radar_palette"] = normalize_custom_palette_order(palette)
+
+    if name is not None:
+        state["custom_radar_name"] = name
+
+    if state["product"] == "radar":
+        if state.get("cax") is not None:
+            draw_radar_colourbar()
+        redraw()
+        if fig is not None:
+            fig.canvas.draw_idle()
+
+
 def load_custom_palette(event=None):
     """Prompt the user to select a radar palette (.pals or .pal) file."""
     try:
@@ -1137,17 +1152,11 @@ def load_custom_palette(event=None):
             return
 
         palette = parse_pals_palette(path)
-        palette = normalize_custom_palette_order(palette)
-        state["custom_radar_palette"] = palette
-        state["custom_radar_name"] = os.path.basename(path)
+        apply_custom_palette(palette, os.path.basename(path))
 
         log_status(
             f"PALETTE -> Loaded custom radar table '{state['custom_radar_name']}'"
         )
-
-        if state["product"] == "radar":
-            redraw()
-            fig.canvas.draw_idle()
 
     except Exception as exc:
         log_status(f"PALETTE ERROR -> {type(exc).__name__}: {exc}")
@@ -1158,15 +1167,9 @@ def reverse_custom_palette(event=None):
     if not state.get("custom_radar_palette"):
         return
 
-    state["custom_radar_palette"] = list(reversed(state["custom_radar_palette"]))
-    state["custom_radar_palette"] = normalize_custom_palette_order(
-        state["custom_radar_palette"]
-    )
+    palette = list(reversed(state["custom_radar_palette"]))
+    apply_custom_palette(palette)
     log_status("PALETTE -> Reversed custom radar table direction.")
-
-    if state["product"] == "radar":
-        redraw()
-        fig.canvas.draw_idle()
 
 
 # ---------------------------------------------------------------------------
