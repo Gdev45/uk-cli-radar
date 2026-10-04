@@ -1115,21 +1115,18 @@ def parse_pals_palette(path):
 
 
 def apply_custom_palette(palette, name=None):
-    """Store a palette and force the active radar legend back visible."""
+    """Store a palette and immediately refresh the radar legend and image."""
     state["custom_radar_palette"] = normalize_custom_palette_order(palette)
 
     if name is not None:
         state["custom_radar_name"] = name
 
-    if state.get("cax") is not None:
-        state["cax"].set_visible(True)
-        draw_radar_colourbar()
-
-    if state["product"] == "radar" and state.get("payload") is not None:
+    if state["product"] == "radar":
+        if state.get("cax") is not None:
+            draw_radar_colourbar()
         redraw()
-
-    if fig is not None:
-        fig.canvas.draw_idle()
+        if fig is not None:
+            fig.canvas.draw_idle()
 
 
 def load_custom_palette(event=None):
@@ -1180,12 +1177,8 @@ def reverse_custom_palette(event=None):
 # ---------------------------------------------------------------------------
 
 def get_radar_norm():
-    """Use a slightly more linear curve for custom palettes so they don't look
-    overly harsh or "sensitive" to small rainfall changes.
-    """
-    gamma = 1.0 if state.get("custom_radar_palette") else 0.85
     return colors.PowerNorm(
-        gamma=gamma,
+        gamma=0.85,
         vmin=RAIN_VMIN,
         vmax=RAIN_VMAX,
         clip=True,
