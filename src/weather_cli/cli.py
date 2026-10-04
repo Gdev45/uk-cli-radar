@@ -1184,7 +1184,7 @@ def get_radar_norm():
     without making the full radar image wash out.
     """
     return colors.PowerNorm(
-        gamma=0.8,
+        gamma=0.75,
         vmin=RAIN_VMIN,
         vmax=RAIN_VMAX,
         clip=True,
