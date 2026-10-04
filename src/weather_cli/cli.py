@@ -97,6 +97,17 @@ SAT_ZORDER = -1             # keep the imagery underneath everything else
 SAT_CREDIT = "IMAGERY: ESRI / MAXAR"
 
 # ---------------------------------------------------------------------------
+# RADAR IMAGE RESOLUTION
+# ---------------------------------------------------------------------------
+# cartopy re-projects the radar only for the view it is drawn in, so the radar
+# is re-drawn for the new view shortly after you stop zooming / panning.
+
+RADAR_REGRID_SCALE = 1.5     # radar pixels per screen pixel (1.0 = one-to-one)
+RADAR_REGRID_MIN = 750       # never lower than cartopy's default
+RADAR_REGRID_MAX = 1800      # cap so very large windows stay quick
+RADAR_SETTLE_SECONDS = 0.6   # wait this long after the view stops changing
+
+# ---------------------------------------------------------------------------
 # PORTRAIT LAYOUT SETTINGS
 # ---------------------------------------------------------------------------
 
@@ -210,6 +221,12 @@ state = {
     "sat_wanted": set(),
     "sat_error_logged": 0.0,
     "sat_confirmed": False,
+
+    "radar_artist": None,
+    "radar_view": None,
+    "radar_style": (1.0, 0),
+    "radar_busy": False,
+    "view_changed_at": 0.0,
 }
 
 
@@ -441,6 +458,12 @@ def set_map_extent(extent):
     ax.set_ylim(extent[2], extent[3])
 
 
+def mark_view_changed():
+    """Note that the view moved, so imagery and radar get refreshed."""
+    state["sat_dirty"] = True
+    state["view_changed_at"] = time.time()
+
+
 def get_default_extent():
     """Portrait extent: fixed height, width from the map area's aspect ratio."""
     fig_w, fig_h = fig.get_size_inches() if fig is not None else FIGURE_SIZE
@@ -495,7 +518,7 @@ def set_default_view():
     set_map_extent(get_default_extent())
 
     state["view_initialized"] = True
-    state["sat_dirty"] = True
+    mark_view_changed()
 
     position_layout()
     fig.canvas.draw_idle()
@@ -570,7 +593,7 @@ def zoom_map(event):
     set_map_extent([new_x_min, new_x_max, new_y_min, new_y_max])
 
     state["view_initialized"] = True
-    state["sat_dirty"] = True
+    mark_view_changed()
 
     fig.canvas.draw_idle()
 
@@ -631,7 +654,7 @@ def pan_move(event):
 
     set_map_extent([new_x_min, new_x_max, new_y_min, new_y_max])
 
-    state["sat_dirty"] = True
+    mark_view_changed()
 
     fig.canvas.draw_idle()
 
@@ -644,7 +667,7 @@ def pan_end(event):
     state["is_panning"] = False
     state["pan_start"] = None
     state["pan_extent"] = None
-    state["sat_dirty"] = True
+    mark_view_changed()
 
 
 # ---------------------------------------------------------------------------
@@ -907,6 +930,8 @@ def draw_basemap():
     """
     state["sat_artist"] = None
     state["sat_signature"] = None
+    state["radar_artist"] = None
+    state["radar_view"] = None
 
     update_satellite()
 
@@ -1269,17 +1294,17 @@ def draw_radar_colourbar():
 
 
 # ---------------------------------------------------------------------------
-# RADAR RENDERING
+# RADAR LAYER
 # ---------------------------------------------------------------------------
 
-def draw_radar():
+def get_radar_regrid_shape():
+    """Radar image size (shorter side, in pixels) to match the current view."""
+    pixels = int(min(ax.bbox.width, ax.bbox.height) * RADAR_REGRID_SCALE)
+    return max(RADAR_REGRID_MIN, min(RADAR_REGRID_MAX, pixels))
 
-    log_status("RENDER -> Drawing UK Radar Rain Rate overlay...")
 
-    current_extent = get_map_extent()
-
-    ax.clear()
-
+def add_radar_layer(alpha=1.0, zorder=0):
+    """Draw the radar rain image for the CURRENT view and return the artist."""
     (
         data,
         projdef,
@@ -1311,28 +1336,120 @@ def draw_radar():
         globe=ccrs.Globe(ellipse="airy")
     )
 
+    rain = np.ma.masked_invalid(data)
+    rain = np.ma.masked_less(rain, RAIN_VMIN)
+
+    artist = ax.imshow(
+        rain,
+        extent=[ul_x, lr_x, lr_y, ul_y],
+        origin="upper",
+        transform=radar_crs,
+        cmap=get_radar_colormap(),
+        norm=get_radar_norm(),
+        interpolation="nearest",
+        alpha=alpha,
+        zorder=zorder,
+        regrid_shape=get_radar_regrid_shape()
+    )
+
+    state["radar_artist"] = artist
+    state["radar_view"] = get_map_extent()
+    state["radar_style"] = (alpha, zorder)
+
+    return artist
+
+
+def view_changed(a, b):
+    if a is None or b is None:
+        return True
+
+    tolerance = 0.002 * abs(a[1] - a[0])
+
+    return any(abs(x - y) > tolerance for x, y in zip(a, b))
+
+
+def refresh_radar_layer():
+    """Re-project the radar for the current view so zoom / pan stay sharp."""
+    try:
+        with draw_lock:
+
+            old = state["radar_artist"]
+
+            if state["payload"] is None or old is None:
+                return
+
+            if state["product"] not in ("radar", "lightning"):
+                return
+
+            alpha, zorder = state["radar_style"]
+
+            x_lim = ax.get_xlim()
+            y_lim = ax.get_ylim()
+
+            # Add the new image before removing the old one: no blank flash.
+            add_radar_layer(alpha, zorder)
+
+            try:
+                old.remove()
+            except Exception:
+                pass
+
+            # imshow can change the view; put it back exactly as it was.
+            ax.set_xlim(x_lim)
+            ax.set_ylim(y_lim)
+
+            fig.canvas.draw_idle()
+
+    except Exception as exc:
+        log_status(f"RENDER ERROR -> {type(exc).__name__}: {exc}")
+
+    finally:
+        state["radar_busy"] = False
+
+
+def radar_view_tick():
+    """Timer callback: re-draw the radar once the view has settled."""
+    if fig is None or ax is None or executor is None:
+        return
+
+    if state["radar_artist"] is None or state["payload"] is None:
+        return
+
+    if state["radar_busy"] or state["is_panning"]:
+        return
+
+    if time.time() - state["view_changed_at"] < RADAR_SETTLE_SECONDS:
+        return
+
+    if not view_changed(get_map_extent(), state["radar_view"]):
+        return
+
+    state["radar_busy"] = True
+
+    executor.submit(refresh_radar_layer)
+
+
+# ---------------------------------------------------------------------------
+# RADAR RENDERING
+# ---------------------------------------------------------------------------
+
+def draw_radar():
+
+    log_status("RENDER -> Drawing UK Radar Rain Rate overlay...")
+
+    current_extent = get_map_extent()
+
+    ax.clear()
+
+    date, starttime = state["payload"][6:8]
+
     ax.set_facecolor("white" if state["fax_mode"] else "black")
 
     set_map_extent(current_extent)
 
     draw_basemap()
 
-    rain = np.ma.masked_invalid(data)
-    rain = np.ma.masked_less(rain, RAIN_VMIN)
-
-    radar_palette = get_radar_colormap()
-    norm = get_radar_norm()
-
-    ax.imshow(
-        rain,
-        extent=[ul_x, lr_x, lr_y, ul_y],
-        origin="upper",
-        transform=radar_crs,
-        cmap=radar_palette,
-        norm=norm,
-        interpolation="nearest",
-        alpha=1.0
-    )
+    add_radar_layer(alpha=1.0, zorder=0)
 
     if state["fax_mode"]:
         coastline_colour = "#202020"
@@ -1441,49 +1558,7 @@ def draw_lightning():
     draw_basemap()
 
     if state.get("payload") is not None:
-        (
-            data,
-            projdef,
-            ul_lat,
-            ul_lon,
-            lr_lat,
-            lr_lon,
-            date,
-            starttime,
-        ) = state["payload"]
-
-        radar_pyproj = CRS.from_proj4(projdef)
-        transformer = Transformer.from_crs(
-            "EPSG:4326",
-            radar_pyproj,
-            always_xy=True,
-        )
-        ul_x, ul_y = transformer.transform(ul_lon, ul_lat)
-        lr_x, lr_y = transformer.transform(lr_lon, lr_lat)
-
-        radar_crs = ccrs.TransverseMercator(
-            central_longitude=-2,
-            central_latitude=49,
-            scale_factor=0.999601,
-            false_easting=400000,
-            false_northing=-100000,
-            globe=ccrs.Globe(ellipse="airy"),
-        )
-
-        rain = np.ma.masked_invalid(data)
-        rain = np.ma.masked_less(rain, RAIN_VMIN)
-
-        ax.imshow(
-            rain,
-            extent=[ul_x, lr_x, lr_y, ul_y],
-            origin="upper",
-            transform=radar_crs,
-            cmap=get_radar_colormap(),
-            norm=get_radar_norm(),
-            interpolation="nearest",
-            alpha=0.18,
-            zorder=1,
-        )
+        add_radar_layer(alpha=0.18, zorder=1)
 
     lightning_data = state.get("lightning_image")
 
@@ -1915,7 +1990,7 @@ def position_layout(event=None):
     except Exception:
         pass
 
-    state["sat_dirty"] = True
+    mark_view_changed()
 
     position_buttons(event)
 
@@ -2131,6 +2206,7 @@ def main():
     )
 
     sat_timer.add_callback(satellite_tick)
+    sat_timer.add_callback(radar_view_tick)
     sat_timer.start()
 
     # -----------------------------------------------------------------------
