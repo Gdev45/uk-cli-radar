@@ -209,6 +209,7 @@ state = {
     "sat_dirty": True,
     "sat_wanted": set(),
     "sat_error_logged": 0.0,
+    "sat_confirmed": False,
 }
 
 
@@ -740,6 +741,10 @@ def fetch_satellite_tile(key):
 
         state["sat_dirty"] = True
 
+        if not state["sat_confirmed"]:
+            state["sat_confirmed"] = True
+            log_status("SATELLITE -> Imagery tiles loading OK.")
+
     except Exception as exc:
         now = time.time()
 
@@ -1106,6 +1111,19 @@ def get_radar_norm():
     )
 
 
+def set_no_rain_colour(cmap):
+    """Colour used where there is no rain.
+
+    It must be fully transparent in normal mode, otherwise the radar image
+    paints an opaque black sheet over the whole UK and hides the satellite
+    imagery underneath. FAX mode has no imagery, so it stays solid white.
+    """
+    if state["fax_mode"]:
+        cmap.set_bad("white", 1.0)
+    else:
+        cmap.set_bad((0.0, 0.0, 0.0, 0.0))
+
+
 def get_radar_colormap():
 
     if state.get("custom_radar_palette"):
@@ -1114,7 +1132,7 @@ def get_radar_colormap():
             state["custom_radar_palette"],
             N=256,
         )
-        cmap.set_bad("white" if state["fax_mode"] else "black", 1.0)
+        set_no_rain_colour(cmap)
         return cmap
 
     if state["fax_mode"]:
@@ -1165,7 +1183,7 @@ def get_radar_colormap():
             "retro_radar", palette, N=256
         )
 
-    cmap.set_bad("white" if state["fax_mode"] else "black", 1.0)
+    set_no_rain_colour(cmap)
 
     return cmap
 
