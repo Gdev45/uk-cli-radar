@@ -2,7 +2,9 @@ import os
 import re
 import math
 import time
+import threading
 import concurrent.futures
+from collections import OrderedDict
 from io import BytesIO
 from urllib.request import Request, urlopen
 
@@ -15,6 +17,7 @@ import matplotlib.colors as colors
 
 import cartopy.crs as ccrs
 
+from PIL import Image
 from matplotlib.widgets import Button
 from botocore import UNSIGNED
 from botocore.config import Config
@@ -42,6 +45,58 @@ LIGHTNING_EXTENT = [-10.5, 2.5, 48.5, 60.5]
 RETRO_FONT = "Courier New"
 
 # ---------------------------------------------------------------------------
+# MAP PROJECTION
+# ---------------------------------------------------------------------------
+# The map used to be drawn in PlateCarree (plain lon/lat), which treats one
+# degree of longitude as the same length as one degree of latitude. At UK
+# latitudes that makes the country look squashed vertically / stretched
+# sideways. Web Mercator keeps shapes correct (and is what the satellite
+# tiles are made in), so the UK now has its real proportions.
+
+try:
+    MAP_CRS = ccrs.Mercator.GOOGLE
+except AttributeError:  # very old / unusual cartopy builds
+    MAP_CRS = ccrs.Mercator(
+        globe=ccrs.Globe(
+            ellipse=None,
+            semimajor_axis=6378137,
+            semiminor_axis=6378137,
+            nadgrids="@null",
+        ),
+        min_latitude=-85.0511287798066,
+        max_latitude=85.0511287798066,
+    )
+
+WEB_MERCATOR_HALF = 20037508.342789244   # half the width of the Web Mercator world (m)
+
+
+def lonlat_to_map(lon, lat):
+    """Convert lon/lat degrees into map (Web Mercator metre) coordinates."""
+    x, y = MAP_CRS.transform_point(lon, lat, ccrs.PlateCarree())
+    return float(x), float(y)
+
+
+# ---------------------------------------------------------------------------
+# SATELLITE BASEMAP SETTINGS
+# ---------------------------------------------------------------------------
+
+SAT_TILE_URL = (
+    "https://server.arcgisonline.com/ArcGIS/rest/services/"
+    "World_Imagery/MapServer/tile/{z}/{y}/{x}"
+)
+SAT_TILE_SIZE = 256
+SAT_MIN_ZOOM = 3
+SAT_MAX_ZOOM = 13
+SAT_MAX_TILES = 48          # most tiles fetched/stitched for one view
+SAT_MARGIN = 0.15           # extra imagery loaded around the view (fraction)
+SAT_WORKERS = 6             # parallel tile downloads
+SAT_CACHE_MAX = 300         # tiles kept in memory
+SAT_REFRESH_MS = 400        # how often the GUI checks for new imagery
+SAT_RETRY_SECONDS = 30      # wait before retrying a tile that failed
+SAT_ZORDER = -1             # keep the imagery underneath everything else
+SAT_CREDIT = "IMAGERY: ESRI / MAXAR"
+
+# ---------------------------------------------------------------------------
 # PORTRAIT LAYOUT SETTINGS
 # ---------------------------------------------------------------------------
 
@@ -55,6 +110,11 @@ DEFAULT_CENTER = (-3.3, 55.05)   # lon, lat
 DEFAULT_HEIGHT_DEG = 14.5        # latitude span shown
 
 MIN_EXTENT = [-30.0, 20.0, 35.0, 70.0]
+
+# The same limits, converted to map metres (used for zoom / pan limits).
+_min_x0, _min_y0 = lonlat_to_map(MIN_EXTENT[0], MIN_EXTENT[2])
+_min_x1, _min_y1 = lonlat_to_map(MIN_EXTENT[1], MIN_EXTENT[3])
+MIN_EXTENT_M = [_min_x0, _min_x1, _min_y0, _min_y1]
 
 RAIN_VMIN = 0.05
 RAIN_VMAX = 16.0
@@ -102,9 +162,20 @@ warning_button = None
 status_bar_ax = None
 auto_timer = None
 lightning_timer = None
+sat_timer = None
 
 s3 = None
 executor = None
+sat_executor = None
+
+# Satellite tile bookkeeping (shared between the GUI and download threads).
+sat_cache = OrderedDict()      # (zoom, x, y) -> uint8 RGB array
+sat_pending = set()            # tiles currently being downloaded
+sat_failed = {}                # tile -> time of last failure
+sat_lock = threading.Lock()
+
+# Stops the timer-driven imagery refresh and a full redraw from interleaving.
+draw_lock = threading.RLock()
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +203,12 @@ state = {
     "lightning_image": None,
     "custom_radar_palette": None,
     "custom_radar_name": None,
+
+    "sat_artist": None,
+    "sat_signature": None,
+    "sat_dirty": True,
+    "sat_wanted": set(),
+    "sat_error_logged": 0.0,
 }
 
 
@@ -348,29 +425,76 @@ def set_win95_title(title_text):
 # ---------------------------------------------------------------------------
 # MAP VIEW
 # ---------------------------------------------------------------------------
+# All view extents are [x_min, x_max, y_min, y_max] in map (Web Mercator)
+# metres, i.e. the axes' own coordinates. Mouse positions from Matplotlib are
+# in the same units, so zoom and pan work directly on them.
+
+def get_map_extent():
+    x_min, x_max = ax.get_xlim()
+    y_min, y_max = ax.get_ylim()
+    return [x_min, x_max, y_min, y_max]
+
+
+def set_map_extent(extent):
+    ax.set_xlim(extent[0], extent[1])
+    ax.set_ylim(extent[2], extent[3])
+
 
 def get_default_extent():
     """Portrait extent: fixed height, width from the map area's aspect ratio."""
     fig_w, fig_h = fig.get_size_inches() if fig is not None else FIGURE_SIZE
     area_aspect = (0.99 * fig_w) / ((MAP_TOP - MAP_BOTTOM) * fig_h)
 
-    height = DEFAULT_HEIGHT_DEG
+    lon, lat = DEFAULT_CENTER
+
+    centre_x, _ = lonlat_to_map(lon, lat)
+    _, y_low = lonlat_to_map(lon, lat - DEFAULT_HEIGHT_DEG / 2)
+    _, y_high = lonlat_to_map(lon, lat + DEFAULT_HEIGHT_DEG / 2)
+
+    height = y_high - y_low
     width = height * area_aspect
 
-    lon, lat = DEFAULT_CENTER
     return [
-        lon - width / 2,
-        lon + width / 2,
-        lat - height / 2,
-        lat + height / 2,
+        centre_x - width / 2,
+        centre_x + width / 2,
+        y_low,
+        y_high,
     ]
+
+
+def fit_extent_in_bounds(x_min, x_max, y_min, y_max):
+    """Slide an extent (without resizing it) back inside MIN_EXTENT_M."""
+    b_x_min, b_x_max, b_y_min, b_y_max = MIN_EXTENT_M
+
+    if x_min < b_x_min:
+        shift = b_x_min - x_min
+        x_min += shift
+        x_max += shift
+
+    if x_max > b_x_max:
+        shift = b_x_max - x_max
+        x_min += shift
+        x_max += shift
+
+    if y_min < b_y_min:
+        shift = b_y_min - y_min
+        y_min += shift
+        y_max += shift
+
+    if y_max > b_y_max:
+        shift = b_y_max - y_max
+        y_min += shift
+        y_max += shift
+
+    return x_min, x_max, y_min, y_max
 
 
 def set_default_view():
 
-    ax.set_extent(get_default_extent(), crs=ccrs.PlateCarree())
+    set_map_extent(get_default_extent())
 
     state["view_initialized"] = True
+    state["sat_dirty"] = True
 
     position_layout()
     fig.canvas.draw_idle()
@@ -406,7 +530,7 @@ def zoom_map(event):
     else:
         return
 
-    x_min, x_max, y_min, y_max = ax.get_extent(crs=ccrs.PlateCarree())
+    x_min, x_max, y_min, y_max = get_map_extent()
 
     mouse_x = event.xdata
     mouse_y = event.ydata
@@ -417,6 +541,13 @@ def zoom_map(event):
     new_width = width * scale
     new_height = height * scale
 
+    # Don't zoom out past the allowed area (keeps the map's proportions).
+    max_width = MIN_EXTENT_M[1] - MIN_EXTENT_M[0]
+    max_height = MIN_EXTENT_M[3] - MIN_EXTENT_M[2]
+
+    if new_width > max_width or new_height > max_height:
+        return
+
     rel_x = (mouse_x - x_min) / width
     rel_y = (mouse_y - y_min) / height
 
@@ -425,10 +556,9 @@ def zoom_map(event):
     new_y_min = mouse_y - rel_y * new_height
     new_y_max = mouse_y + (1.0 - rel_y) * new_height
 
-    new_x_min = max(new_x_min, MIN_EXTENT[0])
-    new_x_max = min(new_x_max, MIN_EXTENT[1])
-    new_y_min = max(new_y_min, MIN_EXTENT[2])
-    new_y_max = min(new_y_max, MIN_EXTENT[3])
+    new_x_min, new_x_max, new_y_min, new_y_max = fit_extent_in_bounds(
+        new_x_min, new_x_max, new_y_min, new_y_max
+    )
 
     if new_x_max <= new_x_min:
         return
@@ -436,12 +566,10 @@ def zoom_map(event):
     if new_y_max <= new_y_min:
         return
 
-    ax.set_extent(
-        [new_x_min, new_x_max, new_y_min, new_y_max],
-        crs=ccrs.PlateCarree()
-    )
+    set_map_extent([new_x_min, new_x_max, new_y_min, new_y_max])
 
     state["view_initialized"] = True
+    state["sat_dirty"] = True
 
     fig.canvas.draw_idle()
 
@@ -458,12 +586,14 @@ def pan_start(event):
     if event.button != 1:
         return
 
-    if event.xdata is None or event.ydata is None:
+    if event.x is None or event.y is None:
         return
 
+    # The drag start is stored in screen pixels (not map coordinates), because
+    # map coordinates move under the mouse as the view is panned.
     state["is_panning"] = True
-    state["pan_start"] = (event.xdata, event.ydata)
-    state["pan_extent"] = ax.get_extent(crs=ccrs.PlateCarree())
+    state["pan_start"] = (event.x, event.y)
+    state["pan_extent"] = get_map_extent()
 
 
 def pan_move(event):
@@ -474,7 +604,7 @@ def pan_move(event):
     if event.inaxes != ax:
         return
 
-    if event.xdata is None or event.ydata is None:
+    if event.x is None or event.y is None:
         return
 
     if state["pan_start"] is None or state["pan_extent"] is None:
@@ -483,38 +613,24 @@ def pan_move(event):
     start_x, start_y = state["pan_start"]
     x_min, x_max, y_min, y_max = state["pan_extent"]
 
-    dx = start_x - event.xdata
-    dy = start_y - event.ydata
+    box = ax.bbox
 
-    new_x_min = x_min + dx
-    new_x_max = x_max + dx
-    new_y_min = y_min + dy
-    new_y_max = y_max + dy
+    if box.width <= 0 or box.height <= 0:
+        return
 
-    if new_x_min < MIN_EXTENT[0]:
-        shift = MIN_EXTENT[0] - new_x_min
-        new_x_min += shift
-        new_x_max += shift
+    dx = (start_x - event.x) * (x_max - x_min) / box.width
+    dy = (start_y - event.y) * (y_max - y_min) / box.height
 
-    if new_x_max > MIN_EXTENT[1]:
-        shift = MIN_EXTENT[1] - new_x_max
-        new_x_min += shift
-        new_x_max += shift
-
-    if new_y_min < MIN_EXTENT[2]:
-        shift = MIN_EXTENT[2] - new_y_min
-        new_y_min += shift
-        new_y_max += shift
-
-    if new_y_max > MIN_EXTENT[3]:
-        shift = MIN_EXTENT[3] - new_y_max
-        new_y_min += shift
-        new_y_max += shift
-
-    ax.set_extent(
-        [new_x_min, new_x_max, new_y_min, new_y_max],
-        crs=ccrs.PlateCarree()
+    new_x_min, new_x_max, new_y_min, new_y_max = fit_extent_in_bounds(
+        x_min + dx,
+        x_max + dx,
+        y_min + dy,
+        y_max + dy,
     )
+
+    set_map_extent([new_x_min, new_x_max, new_y_min, new_y_max])
+
+    state["sat_dirty"] = True
 
     fig.canvas.draw_idle()
 
@@ -527,6 +643,311 @@ def pan_end(event):
     state["is_panning"] = False
     state["pan_start"] = None
     state["pan_extent"] = None
+    state["sat_dirty"] = True
+
+
+# ---------------------------------------------------------------------------
+# SATELLITE BASEMAP
+# ---------------------------------------------------------------------------
+# Imagery is Esri World Imagery in Web Mercator tiles, which match the map
+# projection exactly, so the tiles are stitched into one image and placed
+# straight onto the map with no re-projection.
+#
+# Downloads happen on background threads. The GUI only ever reads tiles that
+# are already in the cache, and a timer picks up new tiles as they arrive.
+
+def get_satellite_tile_range():
+    """Work out the tile zoom and tile index range covering the current view."""
+    x_min, x_max = ax.get_xlim()
+    y_min, y_max = ax.get_ylim()
+
+    width = x_max - x_min
+    height = y_max - y_min
+
+    if width <= 0 or height <= 0:
+        return None
+
+    pixel_width = max(float(ax.bbox.width), 200.0)
+    metres_per_pixel = width / pixel_width
+
+    full_world_res = (2.0 * WEB_MERCATOR_HALF) / SAT_TILE_SIZE
+    ideal_zoom = math.log2(full_world_res / metres_per_pixel)
+
+    zoom = int(math.ceil(ideal_zoom - 0.3))
+    zoom = max(SAT_MIN_ZOOM, min(SAT_MAX_ZOOM, zoom))
+
+    # Load a little more than is visible so small pans don't show gaps.
+    x0 = max(x_min - width * SAT_MARGIN, -WEB_MERCATOR_HALF)
+    x1 = min(x_max + width * SAT_MARGIN, WEB_MERCATOR_HALF)
+    y0 = max(y_min - height * SAT_MARGIN, -WEB_MERCATOR_HALF)
+    y1 = min(y_max + height * SAT_MARGIN, WEB_MERCATOR_HALF)
+
+    while True:
+        n = 2 ** zoom
+        tile_m = (2.0 * WEB_MERCATOR_HALF) / n
+
+        tx0 = int(math.floor((x0 + WEB_MERCATOR_HALF) / tile_m))
+        tx1 = int(math.floor((x1 + WEB_MERCATOR_HALF) / tile_m))
+        ty0 = int(math.floor((WEB_MERCATOR_HALF - y1) / tile_m))
+        ty1 = int(math.floor((WEB_MERCATOR_HALF - y0) / tile_m))
+
+        tx0 = max(0, min(n - 1, tx0))
+        tx1 = max(0, min(n - 1, tx1))
+        ty0 = max(0, min(n - 1, ty0))
+        ty1 = max(0, min(n - 1, ty1))
+
+        count = (tx1 - tx0 + 1) * (ty1 - ty0 + 1)
+
+        if count <= SAT_MAX_TILES or zoom <= SAT_MIN_ZOOM:
+            break
+
+        zoom -= 1
+
+    return zoom, tx0, tx1, ty0, ty1, tile_m
+
+
+def fetch_satellite_tile(key):
+    """Download one imagery tile into the cache (runs on a worker thread)."""
+    zoom, x, y = key
+
+    try:
+        if key not in state["sat_wanted"]:
+            # The view has moved on since this was queued; skip it.
+            return
+
+        request = Request(
+            SAT_TILE_URL.format(z=zoom, x=x, y=y),
+            headers={"User-Agent": "UK-Retro-Radar/0.2.0"},
+        )
+
+        with urlopen(request, timeout=15) as response:
+            data = response.read()
+
+        image = Image.open(BytesIO(data)).convert("RGB")
+        tile = np.asarray(image, dtype=np.uint8)
+
+        if tile.shape != (SAT_TILE_SIZE, SAT_TILE_SIZE, 3):
+            raise RuntimeError(f"Unexpected tile size {tile.shape}")
+
+        with sat_lock:
+            sat_cache[key] = tile
+            sat_cache.move_to_end(key)
+
+            while len(sat_cache) > SAT_CACHE_MAX:
+                sat_cache.popitem(last=False)
+
+            sat_failed.pop(key, None)
+
+        state["sat_dirty"] = True
+
+    except Exception as exc:
+        now = time.time()
+
+        with sat_lock:
+            sat_failed[key] = now
+
+        # Log at most once a minute so being offline doesn't flood the log.
+        if now - state["sat_error_logged"] > 60:
+            state["sat_error_logged"] = now
+            log_status(f"SATELLITE ERROR -> {type(exc).__name__}: {exc}")
+
+    finally:
+        with sat_lock:
+            sat_pending.discard(key)
+
+
+def request_satellite_tiles(keys):
+    """Queue downloads for any tiles that aren't cached, pending or failing."""
+    if sat_executor is None:
+        return
+
+    now = time.time()
+    queued = []
+
+    with sat_lock:
+        for key in keys:
+            if key in sat_pending:
+                continue
+
+            if now - sat_failed.get(key, 0.0) < SAT_RETRY_SECONDS:
+                continue
+
+            sat_pending.add(key)
+            queued.append(key)
+
+    for key in queued:
+        sat_executor.submit(fetch_satellite_tile, key)
+
+
+def remove_satellite_layer():
+    artist = state.get("sat_artist")
+
+    if artist is not None:
+        try:
+            artist.remove()
+        except Exception:
+            pass
+
+    state["sat_artist"] = None
+
+
+def update_satellite():
+    """Rebuild the satellite layer for the current view (GUI thread / redraw)."""
+    if ax is None:
+        return
+
+    with draw_lock:
+
+        state["sat_dirty"] = False
+
+        # Fax mode is a plain white/ink display, so no imagery there.
+        if state["fax_mode"]:
+            remove_satellite_layer()
+            state["sat_signature"] = None
+            return
+
+        tile_range = get_satellite_tile_range()
+
+        if tile_range is None:
+            return
+
+        zoom, tx0, tx1, ty0, ty1, tile_m = tile_range
+
+        keys = [
+            (zoom, x, y)
+            for y in range(ty0, ty1 + 1)
+            for x in range(tx0, tx1 + 1)
+        ]
+
+        state["sat_wanted"] = set(keys)
+
+        with sat_lock:
+            missing = [key for key in keys if key not in sat_cache]
+
+        if missing:
+            request_satellite_tiles(missing)
+
+        loaded = len(keys) - len(missing)
+        signature = (zoom, tx0, tx1, ty0, ty1, loaded)
+
+        # Nothing new to show since the last build.
+        if signature == state["sat_signature"] and state["sat_artist"] is not None:
+            return
+
+        # Nothing downloaded yet: leave whatever is on screen alone.
+        if loaded == 0:
+            return
+
+        cols = tx1 - tx0 + 1
+        rows = ty1 - ty0 + 1
+
+        mosaic = np.zeros(
+            (rows * SAT_TILE_SIZE, cols * SAT_TILE_SIZE, 4),
+            dtype=np.uint8,
+        )
+
+        with sat_lock:
+            for r, ty in enumerate(range(ty0, ty1 + 1)):
+                for c, tx in enumerate(range(tx0, tx1 + 1)):
+                    tile = sat_cache.get((zoom, tx, ty))
+
+                    if tile is None:
+                        continue
+
+                    sat_cache.move_to_end((zoom, tx, ty))
+
+                    y_from = r * SAT_TILE_SIZE
+                    x_from = c * SAT_TILE_SIZE
+
+                    mosaic[
+                        y_from:y_from + SAT_TILE_SIZE,
+                        x_from:x_from + SAT_TILE_SIZE,
+                        :3
+                    ] = tile
+                    mosaic[
+                        y_from:y_from + SAT_TILE_SIZE,
+                        x_from:x_from + SAT_TILE_SIZE,
+                        3
+                    ] = 255
+
+        left = -WEB_MERCATOR_HALF + tx0 * tile_m
+        right = -WEB_MERCATOR_HALF + (tx1 + 1) * tile_m
+        top = WEB_MERCATOR_HALF - ty0 * tile_m
+        bottom = WEB_MERCATOR_HALF - (ty1 + 1) * tile_m
+
+        remove_satellite_layer()
+
+        x_lim = ax.get_xlim()
+        y_lim = ax.get_ylim()
+
+        state["sat_artist"] = ax.imshow(
+            mosaic,
+            extent=[left, right, bottom, top],
+            origin="upper",
+            interpolation="bilinear",
+            zorder=SAT_ZORDER,
+        )
+
+        # imshow can change the view; put it back exactly as it was.
+        ax.set_xlim(x_lim)
+        ax.set_ylim(y_lim)
+
+        state["sat_signature"] = signature
+
+
+def draw_basemap():
+    """Satellite imagery under the radar / lightning / warnings pages.
+
+    Called right after ax.clear(), which wipes the previous imagery layer.
+    """
+    state["sat_artist"] = None
+    state["sat_signature"] = None
+
+    update_satellite()
+
+    if not state["fax_mode"]:
+        ax.text(
+            0.99,
+            0.008,
+            SAT_CREDIT,
+            transform=ax.transAxes,
+            color="white",
+            fontsize=6,
+            fontname=RETRO_FONT,
+            ha="right",
+            va="bottom",
+            zorder=20,
+            bbox=dict(
+                facecolor="black",
+                edgecolor="#b89b00",
+                linewidth=0.5,
+                boxstyle="square,pad=0.2",
+                alpha=0.85,
+            ),
+        )
+
+
+def satellite_tick():
+    """Timer callback: pick up newly arrived tiles / a changed view."""
+    if fig is None or ax is None:
+        return
+
+    if not state["sat_dirty"]:
+        return
+
+    # If a full redraw is in progress, try again on the next tick.
+    if not draw_lock.acquire(blocking=False):
+        return
+
+    try:
+        update_satellite()
+        fig.canvas.draw_idle()
+
+    except Exception as exc:
+        log_status(f"SATELLITE ERROR -> {type(exc).__name__}: {exc}")
+
+    finally:
+        draw_lock.release()
 
 
 # ---------------------------------------------------------------------------
@@ -837,7 +1258,7 @@ def draw_radar():
 
     log_status("RENDER -> Drawing UK Radar Rain Rate overlay...")
 
-    current_extent = ax.get_extent(crs=ccrs.PlateCarree())
+    current_extent = get_map_extent()
 
     ax.clear()
 
@@ -874,7 +1295,9 @@ def draw_radar():
 
     ax.set_facecolor("white" if state["fax_mode"] else "black")
 
-    ax.set_extent(current_extent, crs=ccrs.PlateCarree())
+    set_map_extent(current_extent)
+
+    draw_basemap()
 
     rain = np.ma.masked_invalid(data)
     rain = np.ma.masked_less(rain, RAIN_VMIN)
@@ -982,7 +1405,7 @@ def draw_lightning():
     """Render the live lightning page in the main map area."""
     log_status("RENDER -> Drawing real-time UK lightning map...")
 
-    current_extent = ax.get_extent(crs=ccrs.PlateCarree())
+    current_extent = get_map_extent()
 
     ax.clear()
 
@@ -995,7 +1418,9 @@ def draw_lightning():
         map_text_colour = "#00ffff"
         edge_colour = "#b89b00"
 
-    ax.set_extent(current_extent, crs=ccrs.PlateCarree())
+    set_map_extent(current_extent)
+
+    draw_basemap()
 
     if state.get("payload") is not None:
         (
@@ -1122,7 +1547,9 @@ def draw_warnings():
         panel_color = "#111111"
         accent = "#b89b00"
 
-    ax.set_extent(get_default_extent(), crs=ccrs.PlateCarree())
+    set_map_extent(get_default_extent())
+
+    draw_basemap()
 
     if state["warnings"]:
         # Wrap long lines so they stay inside a narrow portrait panel.
@@ -1243,15 +1670,17 @@ def refresh_lightning(event=None):
 
 def redraw():
 
-    if state["product"] == "lightning":
-        draw_lightning()
-    elif state["product"] == "warnings":
-        draw_warnings()
-    else:
-        draw_radar()
-        update_fax_button()
+    with draw_lock:
 
-    fig.canvas.draw_idle()
+        if state["product"] == "lightning":
+            draw_lightning()
+        elif state["product"] == "warnings":
+            draw_warnings()
+        else:
+            draw_radar()
+            update_fax_button()
+
+        fig.canvas.draw_idle()
 
 
 # ---------------------------------------------------------------------------
@@ -1452,24 +1881,23 @@ def position_layout(event=None):
     )
 
     try:
-        x_min, x_max, y_min, y_max = ax.get_extent(crs=ccrs.PlateCarree())
+        x_min, x_max, y_min, y_max = get_map_extent()
 
         centre_x = (x_min + x_max) / 2
         height = abs(y_max - y_min)
 
         if height > 0:
             width = height * box_aspect
-            ax.set_extent(
-                [
-                    centre_x - width / 2,
-                    centre_x + width / 2,
-                    y_min,
-                    y_max,
-                ],
-                crs=ccrs.PlateCarree()
-            )
+            set_map_extent([
+                centre_x - width / 2,
+                centre_x + width / 2,
+                y_min,
+                y_max,
+            ])
     except Exception:
         pass
+
+    state["sat_dirty"] = True
 
     position_buttons(event)
 
@@ -1503,8 +1931,10 @@ def main():
     global status_bar_ax
     global auto_timer
     global lightning_timer
+    global sat_timer
     global s3
     global executor
+    global sat_executor
 
     # -----------------------------------------------------------------------
     # AWS S3
@@ -1517,6 +1947,9 @@ def main():
     )
 
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+
+    # Separate pool for satellite tiles so they never hold up radar downloads.
+    sat_executor = concurrent.futures.ThreadPoolExecutor(max_workers=SAT_WORKERS)
 
     # -----------------------------------------------------------------------
     # FIGURE (portrait)
@@ -1533,7 +1966,7 @@ def main():
 
     ax = fig.add_axes(
         [0.01, MAP_BOTTOM, 0.98, 0.77],
-        projection=ccrs.PlateCarree(),
+        projection=MAP_CRS,
         facecolor="black"
     )
 
@@ -1670,6 +2103,17 @@ def main():
 
     lightning_timer.add_callback(refresh_lightning)
     lightning_timer.start()
+
+    # -----------------------------------------------------------------------
+    # SATELLITE IMAGERY TIMER
+    # -----------------------------------------------------------------------
+
+    sat_timer = fig.canvas.new_timer(
+        interval=SAT_REFRESH_MS
+    )
+
+    sat_timer.add_callback(satellite_tick)
+    sat_timer.start()
 
     # -----------------------------------------------------------------------
     # RUN GUI
