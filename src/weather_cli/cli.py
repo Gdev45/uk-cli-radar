@@ -989,17 +989,37 @@ def normalize_custom_palette_order(palette):
     if len(palette) < 2:
         return palette
 
-    def warm_score(rgb):
-        r, g, b = rgb
+    entries = []
+    for index, entry in enumerate(palette):
+        if isinstance(entry, (tuple, list)) and len(entry) == 2:
+            pos, value = entry
+            entries.append((pos, value))
+        else:
+            entries.append((index / (len(palette) - 1), entry))
+
+    def resolve_rgb(value):
+        if isinstance(value, str):
+            return colors.to_rgb(value)
+        if isinstance(value, (tuple, list)) and len(value) == 3:
+            return tuple(float(v) for v in value)
+        raise TypeError(f"Unsupported palette colour entry: {value!r}")
+
+    def warm_score(value):
+        r, g, b = resolve_rgb(value)
         return (0.55 * r) + (0.35 * g) + (0.10 * b)
 
-    first_score = warm_score(palette[0])
-    last_score = warm_score(palette[-1])
+    first_score = warm_score(entries[0][1])
+    last_score = warm_score(entries[-1][1])
 
     if first_score > last_score + 0.12:
-        return list(reversed(palette))
+        reversed_colors = [entry[1] for entry in reversed(entries)]
+        normalized = [
+            (0.0 if len(reversed_colors) == 1 else index / (len(reversed_colors) - 1), value)
+            for index, value in enumerate(reversed_colors)
+        ]
+        return normalized
 
-    return palette
+    return [(0.0 if len(entries) == 1 else index / (len(entries) - 1), value) for index, (_, value) in enumerate(entries)]
 
 
 def parse_pals_palette(path):
@@ -1097,6 +1117,7 @@ def load_custom_palette(event=None):
             return
 
         palette = parse_pals_palette(path)
+        palette = normalize_custom_palette_order(palette)
         state["custom_radar_palette"] = palette
         state["custom_radar_name"] = os.path.basename(path)
 
@@ -1117,6 +1138,9 @@ def reverse_custom_palette(event=None):
         return
 
     state["custom_radar_palette"] = list(reversed(state["custom_radar_palette"]))
+    state["custom_radar_palette"] = normalize_custom_palette_order(
+        state["custom_radar_palette"]
+    )
     log_status("PALETTE -> Reversed custom radar table direction.")
 
     if state["product"] == "radar" and state.get("payload") is not None:
