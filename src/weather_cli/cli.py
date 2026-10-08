@@ -120,10 +120,15 @@ SAT_CREDIT = "IMAGERY: ESRI / MAXAR"
 # cartopy re-projects the radar only for the view it is drawn in, so the radar
 # is re-drawn for the new view shortly after you stop zooming / panning.
 
-RADAR_REGRID_SCALE = 1.5     # radar pixels per screen pixel (1.0 = one-to-one)
-RADAR_REGRID_MIN = 750       # never lower than cartopy's default
-RADAR_REGRID_MAX = 1800      # cap so very large windows stay quick
-RADAR_SETTLE_SECONDS = 0.6   # wait this long after the view stops changing
+# Keep the radar responsive while panning by rendering a lower-res preview
+# during motion and only doing the expensive high-detail redraw after the view
+# settles. This prevents the app from reprojecting the whole radar field on
+# every tiny mouse movement.
+RADAR_REGRID_SCALE = 0.8     # lower than the previous 1.5x to keep redraws cheap
+RADAR_REGRID_MIN = 400       # avoid over-rendering on small windows
+RADAR_REGRID_MAX = 1100      # still gives a good image without blowing up CPU
+RADAR_SETTLE_SECONDS = 1.0   # wait longer before the expensive redraw
+RADAR_VIEW_TOLERANCE = 0.02  # ignore tiny motion jitter while panning/zooming
 
 # ---------------------------------------------------------------------------
 # PORTRAIT LAYOUT SETTINGS
@@ -1479,7 +1484,7 @@ def view_changed(a, b):
     if a is None or b is None:
         return True
 
-    tolerance = 0.002 * abs(a[1] - a[0])
+    tolerance = RADAR_VIEW_TOLERANCE * abs(a[1] - a[0])
 
     return any(abs(x - y) > tolerance for x, y in zip(a, b))
 
