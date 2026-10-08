@@ -120,15 +120,10 @@ SAT_CREDIT = "IMAGERY: ESRI / MAXAR"
 # cartopy re-projects the radar only for the view it is drawn in, so the radar
 # is re-drawn for the new view shortly after you stop zooming / panning.
 
-# Keep the radar responsive while panning by rendering a lower-res preview
-# during motion and only doing the expensive high-detail redraw after the view
-# settles. This prevents the app from reprojecting the whole radar field on
-# every tiny mouse movement.
-RADAR_REGRID_SCALE = 0.8     # lower than the previous 1.5x to keep redraws cheap
-RADAR_REGRID_MIN = 400       # avoid over-rendering on small windows
-RADAR_REGRID_MAX = 1100      # still gives a good image without blowing up CPU
-RADAR_SETTLE_SECONDS = 1.0   # wait longer before the expensive redraw
-RADAR_VIEW_TOLERANCE = 0.02  # ignore tiny motion jitter while panning/zooming
+RADAR_REGRID_SCALE = 1.5     # radar pixels per screen pixel (1.0 = one-to-one)
+RADAR_REGRID_MIN = 750       # never lower than cartopy's default
+RADAR_REGRID_MAX = 1800      # cap so very large windows stay quick
+RADAR_SETTLE_SECONDS = 0.6   # wait this long after the view stops changing
 
 # ---------------------------------------------------------------------------
 # PORTRAIT LAYOUT SETTINGS
@@ -247,8 +242,6 @@ state = {
 
     "radar_artist": None,
     "radar_view": None,
-    "radar_extent": None,
-    "radar_crs": None,
     "radar_style": (1.0, 0),
     "radar_busy": False,
     "view_changed_at": 0.0,
@@ -340,31 +333,6 @@ def find_latest_radar():
 # LOAD RADAR HDF5
 # ---------------------------------------------------------------------------
 
-def get_radar_projection(projdef):
-    """Reuse the expensive CRS setup for the radar grid instead of rebuilding it."""
-    cache = state.get("radar_projection_cache")
-    if cache is None:
-        cache = {}
-        state["radar_projection_cache"] = cache
-
-    if projdef in cache:
-        return cache[projdef]
-
-    radar_pyproj = CRS.from_proj4(projdef)
-    transformer = Transformer.from_crs("EPSG:4326", radar_pyproj, always_xy=True)
-    radar_crs = ccrs.TransverseMercator(
-        central_longitude=-2,
-        central_latitude=49,
-        scale_factor=0.999601,
-        false_easting=400000,
-        false_northing=-100000,
-        globe=ccrs.Globe(ellipse="airy"),
-    )
-
-    cache[projdef] = (transformer, radar_crs)
-    return cache[projdef]
-
-
 def load_radar(filename):
 
     log_status(f"HDF5 READ -> Parsing radar matrix from {filename}...")
@@ -379,7 +347,6 @@ def load_radar(filename):
         offset = float(info.attrs["offset"])
         nodata = float(info.attrs["nodata"])
 
-        data = data.astype(np.float32, copy=False)
         data = data * gain + offset
         data[data == nodata] = np.nan
 
@@ -391,12 +358,6 @@ def load_radar(filename):
         ul_lon = float(where.attrs["UL_lon"])
         lr_lat = float(where.attrs["LR_lat"])
         lr_lon = float(where.attrs["LR_lon"])
-
-        transformer, radar_crs = get_radar_projection(projdef)
-        ul_x, ul_y = transformer.transform(ul_lon, ul_lat)
-        lr_x, lr_y = transformer.transform(lr_lon, lr_lat)
-        state["radar_extent"] = [float(ul_x), float(lr_x), float(lr_y), float(ul_y)]
-        state["radar_crs"] = radar_crs
 
         date = f["dataset1/what"].attrs["startdate"]
         if isinstance(date, bytes):
@@ -1435,34 +1396,43 @@ def get_radar_regrid_shape():
 
 def add_radar_layer(alpha=1.0, zorder=0):
     """Draw the radar rain image for the CURRENT view and return the artist."""
-    data, _, _, _, _, _, _, _ = state["payload"]
+    (
+        data,
+        projdef,
+        ul_lat,
+        ul_lon,
+        lr_lat,
+        lr_lon,
+        date,
+        starttime
+    ) = state["payload"]
 
-    radar_extent = state.get("radar_extent")
-    if radar_extent is None:
-        radar_extent = [
-            state["payload"][2],
-            state["payload"][3],
-            state["payload"][4],
-            state["payload"][5],
-        ]
+    radar_pyproj = CRS.from_proj4(projdef)
 
-    radar_crs = state.get("radar_crs")
-    if radar_crs is None:
-        radar_crs = ccrs.TransverseMercator(
-            central_longitude=-2,
-            central_latitude=49,
-            scale_factor=0.999601,
-            false_easting=400000,
-            false_northing=-100000,
-            globe=ccrs.Globe(ellipse="airy"),
-        )
+    transformer = Transformer.from_crs(
+        "EPSG:4326",
+        radar_pyproj,
+        always_xy=True
+    )
 
-    rain = np.asarray(data, dtype=np.float32, order="C")
-    rain = np.where(np.isfinite(rain) & (rain >= RAIN_VMIN), rain, np.nan)
+    ul_x, ul_y = transformer.transform(ul_lon, ul_lat)
+    lr_x, lr_y = transformer.transform(lr_lon, lr_lat)
+
+    radar_crs = ccrs.TransverseMercator(
+        central_longitude=-2,
+        central_latitude=49,
+        scale_factor=0.999601,
+        false_easting=400000,
+        false_northing=-100000,
+        globe=ccrs.Globe(ellipse="airy")
+    )
+
+    rain = np.ma.masked_invalid(data)
+    rain = np.ma.masked_less(rain, RAIN_VMIN)
 
     artist = ax.imshow(
         rain,
-        extent=radar_extent,
+        extent=[ul_x, lr_x, lr_y, ul_y],
         origin="upper",
         transform=radar_crs,
         cmap=get_radar_colormap(),
@@ -1484,7 +1454,7 @@ def view_changed(a, b):
     if a is None or b is None:
         return True
 
-    tolerance = RADAR_VIEW_TOLERANCE * abs(a[1] - a[0])
+    tolerance = 0.002 * abs(a[1] - a[0])
 
     return any(abs(x - y) > tolerance for x, y in zip(a, b))
 
