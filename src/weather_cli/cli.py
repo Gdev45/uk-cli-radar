@@ -242,6 +242,8 @@ state = {
 
     "radar_artist": None,
     "radar_view": None,
+    "radar_extent": None,
+    "radar_crs": None,
     "radar_style": (1.0, 0),
     "radar_busy": False,
     "view_changed_at": 0.0,
@@ -333,6 +335,31 @@ def find_latest_radar():
 # LOAD RADAR HDF5
 # ---------------------------------------------------------------------------
 
+def get_radar_projection(projdef):
+    """Reuse the expensive CRS setup for the radar grid instead of rebuilding it."""
+    cache = state.get("radar_projection_cache")
+    if cache is None:
+        cache = {}
+        state["radar_projection_cache"] = cache
+
+    if projdef in cache:
+        return cache[projdef]
+
+    radar_pyproj = CRS.from_proj4(projdef)
+    transformer = Transformer.from_crs("EPSG:4326", radar_pyproj, always_xy=True)
+    radar_crs = ccrs.TransverseMercator(
+        central_longitude=-2,
+        central_latitude=49,
+        scale_factor=0.999601,
+        false_easting=400000,
+        false_northing=-100000,
+        globe=ccrs.Globe(ellipse="airy"),
+    )
+
+    cache[projdef] = (transformer, radar_crs)
+    return cache[projdef]
+
+
 def load_radar(filename):
 
     log_status(f"HDF5 READ -> Parsing radar matrix from {filename}...")
@@ -347,6 +374,7 @@ def load_radar(filename):
         offset = float(info.attrs["offset"])
         nodata = float(info.attrs["nodata"])
 
+        data = data.astype(np.float32, copy=False)
         data = data * gain + offset
         data[data == nodata] = np.nan
 
@@ -358,6 +386,12 @@ def load_radar(filename):
         ul_lon = float(where.attrs["UL_lon"])
         lr_lat = float(where.attrs["LR_lat"])
         lr_lon = float(where.attrs["LR_lon"])
+
+        transformer, radar_crs = get_radar_projection(projdef)
+        ul_x, ul_y = transformer.transform(ul_lon, ul_lat)
+        lr_x, lr_y = transformer.transform(lr_lon, lr_lat)
+        state["radar_extent"] = [float(ul_x), float(lr_x), float(lr_y), float(ul_y)]
+        state["radar_crs"] = radar_crs
 
         date = f["dataset1/what"].attrs["startdate"]
         if isinstance(date, bytes):
@@ -1396,43 +1430,34 @@ def get_radar_regrid_shape():
 
 def add_radar_layer(alpha=1.0, zorder=0):
     """Draw the radar rain image for the CURRENT view and return the artist."""
-    (
-        data,
-        projdef,
-        ul_lat,
-        ul_lon,
-        lr_lat,
-        lr_lon,
-        date,
-        starttime
-    ) = state["payload"]
+    data, _, _, _, _, _, _, _ = state["payload"]
 
-    radar_pyproj = CRS.from_proj4(projdef)
+    radar_extent = state.get("radar_extent")
+    if radar_extent is None:
+        radar_extent = [
+            state["payload"][2],
+            state["payload"][3],
+            state["payload"][4],
+            state["payload"][5],
+        ]
 
-    transformer = Transformer.from_crs(
-        "EPSG:4326",
-        radar_pyproj,
-        always_xy=True
-    )
+    radar_crs = state.get("radar_crs")
+    if radar_crs is None:
+        radar_crs = ccrs.TransverseMercator(
+            central_longitude=-2,
+            central_latitude=49,
+            scale_factor=0.999601,
+            false_easting=400000,
+            false_northing=-100000,
+            globe=ccrs.Globe(ellipse="airy"),
+        )
 
-    ul_x, ul_y = transformer.transform(ul_lon, ul_lat)
-    lr_x, lr_y = transformer.transform(lr_lon, lr_lat)
-
-    radar_crs = ccrs.TransverseMercator(
-        central_longitude=-2,
-        central_latitude=49,
-        scale_factor=0.999601,
-        false_easting=400000,
-        false_northing=-100000,
-        globe=ccrs.Globe(ellipse="airy")
-    )
-
-    rain = np.ma.masked_invalid(data)
-    rain = np.ma.masked_less(rain, RAIN_VMIN)
+    rain = np.asarray(data, dtype=np.float32, order="C")
+    rain = np.where(np.isfinite(rain) & (rain >= RAIN_VMIN), rain, np.nan)
 
     artist = ax.imshow(
         rain,
-        extent=[ul_x, lr_x, lr_y, ul_y],
+        extent=radar_extent,
         origin="upper",
         transform=radar_crs,
         cmap=get_radar_colormap(),
